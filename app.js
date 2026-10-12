@@ -7,14 +7,25 @@
     profile: { name: 'Aisha', goal: 'academic', wordGoal: 500 },
     topic: '', ideas: [], outline: { intro: '', body1: '', body2: '', conclusion: '' },
     draftTitle: '', draft: '', activeStage: 'brainstorming', completedStages: [],
+    works: [], activeWorkId: null,
     checklist: { thesis: false, evidence: false, transitions: false, proofread: false },
     sessionsByDay: {}, activeDays: [], totalSessions: 0, totalWords: 0, bestStreak: 0
   });
   function loadState() {
-    try { const raw = localStorage.getItem(STORAGE_KEY); if (!raw) return defaultState(); const s = JSON.parse(raw); return { ...defaultState(), ...s, profile: { ...defaultState().profile, ...(s.profile || {}) }, outline: { ...defaultState().outline, ...(s.outline || {}) }, checklist: { ...defaultState().checklist, ...(s.checklist || {}) }, ideas: Array.isArray(s.ideas) ? s.ideas : [], completedStages: Array.isArray(s.completedStages) ? s.completedStages : [], activeDays: Array.isArray(s.activeDays) ? s.activeDays : [], sessionsByDay: s.sessionsByDay || {} }; } catch { return defaultState(); }
+    try { const raw = localStorage.getItem(STORAGE_KEY); if (!raw) return defaultState(); const s = JSON.parse(raw); return { ...defaultState(), ...s, profile: { ...defaultState().profile, ...(s.profile || {}) }, outline: { ...defaultState().outline, ...(s.outline || {}) }, checklist: { ...defaultState().checklist, ...(s.checklist || {}) }, ideas: Array.isArray(s.ideas) ? s.ideas : [], works: Array.isArray(s.works) ? s.works : [], activeWorkId: s.activeWorkId || null, completedStages: Array.isArray(s.completedStages) ? s.completedStages : [], activeDays: Array.isArray(s.activeDays) ? s.activeDays : [], sessionsByDay: s.sessionsByDay || {} }; } catch { return defaultState(); }
   }
   let state = loadState();
   let mode = 'focus', remaining = 25 * 60, interval = null, running = false, toastTimer = null;
+  const config = window.PomoWriteConfig || {};
+  let supabaseClient = null, authSession = null, authUser = null, cloudSaveTimer = null, cloudSaving = false, cloudSaveQueued = false, skipCloudSync = false;
+  const localStateHasWork = () => !!(state.topic || state.draft || state.draftTitle || state.ideas.length || Object.values(state.outline).some(Boolean) || state.totalSessions || state.activeDays.length || state.completedStages.length || Object.values(state.checklist).some(Boolean) || state.profile.name !== 'Aisha' || state.profile.goal !== 'academic' || Number(state.profile.wordGoal) !== 500 || state.works.length);
+  const makeId = () => (window.crypto && crypto.randomUUID ? crypto.randomUUID() : `work-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  const hasCurrentWork = (s = state) => !!(s.topic || s.draft || s.draftTitle || s.ideas.length || Object.values(s.outline).some(Boolean));
+  function workSnapshot(id = state.activeWorkId || makeId()) { return { id, title: state.draftTitle.trim() || state.topic.trim() || 'Untitled draft', topic: state.topic || '', draftTitle: state.draftTitle || '', draft: state.draft || '', ideas: [...state.ideas], outline: { ...state.outline }, activeStage: state.activeStage, completedStages: [...state.completedStages], checklist: { ...state.checklist }, updatedAt: new Date().toISOString() }; }
+  function syncActiveWork() { if (!state.activeWorkId && !hasCurrentWork()) return; if (!state.activeWorkId) state.activeWorkId = makeId(); const work = workSnapshot(state.activeWorkId); const index = state.works.findIndex(item => item.id === state.activeWorkId); if (index < 0) state.works.unshift(work); else state.works[index] = work; }
+  if (window.supabase?.createClient && config.supabaseUrl && config.supabaseAnonKey && !String(config.supabaseUrl).includes('YOUR_')) {
+    try { supabaseClient = window.supabase.createClient(config.supabaseUrl, config.supabaseAnonKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } }); } catch (error) { console.error('Supabase client setup failed:', error); }
+  }
   const $ = (id) => document.getElementById(id);
   const todayKey = today();
   const vocab = [
@@ -47,7 +58,101 @@
     'Read your essay aloud. Awkward transitions often become easier to spot.',
     'A counterargument can strengthen your essay when you address it thoughtfully.'
   ];
-  function save() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch { showToast('Could not save — browser storage may be full.'); } }
+  function save() { syncActiveWork(); try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch { showToast('Could not save — browser storage may be full.'); } if (!skipCloudSync && authUser && supabaseClient) scheduleCloudSave(); if ($('view-works')?.classList.contains('active')) renderWorks(); }
+  function setAuthMessage(message, isError = false) { const el = $('authMessage'); if (el) { el.textContent = message; el.style.color = isError ? '#a35d4f' : ''; } }
+  function setAuthStatus(message) { if ($('authStatus')) $('authStatus').textContent = message; }
+  function setAiStatus(id, message, isError = false) { const el = $(id); if (el) { el.textContent = message; el.style.color = isError ? '#a35d4f' : ''; } }
+  function renderAuthUI() {
+    const configured = !!supabaseClient;
+    $('signInButton').hidden = !configured || !!authUser; $('signUpButton').hidden = !configured || !!authUser;
+    $('signOutButton').hidden = !authUser; $('cloudLoadButton').hidden = !authUser;
+    $('authEmail').disabled = !configured || !!authUser; $('authPassword').disabled = !configured || !!authUser;
+    $('accountHeading').textContent = authUser ? (authUser.email || 'Account connected') : 'Sync your writing';
+    if (!configured) setAuthStatus('Supabase is not configured yet. Local saving still works.');
+    else if (authUser) setAuthStatus(`Signed in · ${authUser.email || 'account'} · cloud sync enabled`);
+    else setAuthStatus('Sign in or create an account to enable private cloud sync.');
+  }
+  function scheduleCloudSave() { clearTimeout(cloudSaveTimer); cloudSaveTimer = setTimeout(() => saveCloudState().catch(err => { console.error(err); setAuthStatus('Cloud sync failed. Your local copy is safe.'); }), 900); }
+  async function saveCloudState() {
+    if (!supabaseClient || !authUser || !authSession?.access_token || skipCloudSync) return;
+    if (cloudSaving) { cloudSaveQueued = true; return; }
+    cloudSaving = true;
+    try {
+      syncActiveWork();
+      for (const work of state.works) {
+        const essayPayload = { id: work.id, user_id: authUser.id, workspace_key: work.id, title: work.draftTitle || work.title || '', topic: work.topic || '', draft: work.draft || '', updated_at: work.updatedAt || new Date().toISOString() };
+        const { data: essay, error: essayError } = await supabaseClient.from('essays').upsert(essayPayload, { onConflict: 'id' }).select('id').single();
+        if (essayError) throw essayError;
+        const planPayload = { user_id: authUser.id, essay_id: essay.id, ideas: work.ideas || [], outline: work.outline || defaultState().outline, active_stage: work.activeStage || 'brainstorming', completed_stages: work.completedStages || [], checklist: work.checklist || defaultState().checklist, updated_at: work.updatedAt || new Date().toISOString() };
+        const { error: planError } = await supabaseClient.from('essay_plans').upsert(planPayload, { onConflict: 'essay_id' });
+        if (planError) throw planError;
+      }
+      const progressPayload = { user_id: authUser.id, profile: state.profile, active_stage: state.activeStage, completed_stages: state.completedStages, checklist: state.checklist, sessions_by_day: state.sessionsByDay, active_days: state.activeDays, total_sessions: state.totalSessions, total_words: state.totalWords, best_streak: state.bestStreak, updated_at: new Date().toISOString() };
+      const { error: progressError } = await supabaseClient.from('user_progress').upsert(progressPayload, { onConflict: 'user_id' });
+      if (progressError) throw progressError;
+      setAuthStatus(`Signed in · ${authUser.email || 'account'} · synced just now`);
+    } finally { cloudSaving = false; if (cloudSaveQueued) { cloudSaveQueued = false; scheduleCloudSave(); } }
+  }
+  function workFromCloud(essay, plan) { return { id: essay.id, title: essay.title || essay.topic || 'Untitled draft', topic: essay.topic || '', draftTitle: essay.title || '', draft: essay.draft || '', ideas: Array.isArray(plan?.ideas) ? plan.ideas : [], outline: { ...defaultState().outline, ...(plan?.outline || {}) }, activeStage: plan?.active_stage || 'brainstorming', completedStages: Array.isArray(plan?.completed_stages) ? plan.completed_stages : [], checklist: { ...defaultState().checklist, ...(plan?.checklist || {}) }, updatedAt: essay.updated_at || essay.created_at || new Date().toISOString() }; }
+  async function loadCloudState({ confirmReplace = true } = {}) {
+    if (!supabaseClient || !authUser) return false;
+    const [{ data: essays, error: essayError }, { data: progress, error: progressError }] = await Promise.all([
+      supabaseClient.from('essays').select('*').eq('user_id', authUser.id).order('updated_at', { ascending: false }),
+      supabaseClient.from('user_progress').select('*').eq('user_id', authUser.id).maybeSingle()
+    ]);
+    if (essayError) throw essayError; if (progressError) throw progressError;
+    const plansByEssay = {};
+    if (essays?.length) { const { data: plans, error } = await supabaseClient.from('essay_plans').select('*').eq('user_id', authUser.id); if (error) throw error; (plans || []).forEach(plan => { plansByEssay[plan.essay_id] = plan; }); }
+    const cloudWorks = (essays || []).map(essay => workFromCloud(essay, plansByEssay[essay.id]));
+    if (!cloudWorks.length && !progress) {
+      if (hasCurrentWork() && !state.works.length) syncActiveWork();
+      await saveCloudState(); setAuthStatus('Cloud workspace created from this device.'); return true;
+    }
+    if (confirmReplace && localStateHasWork() && !window.confirm('Load cloud works and merge them with this browser’s saved works? Existing local work stays on this device. Choose Cancel to keep and upload your local copy.')) { await saveCloudState(); showToast('Kept this device copy and uploaded it to the cloud.'); return false; }
+    skipCloudSync = true;
+    try {
+      const merged = new Map();
+      state.works.forEach(work => merged.set(work.id, work));
+      cloudWorks.forEach(work => { const duplicate = [...merged.values()].find(local => local.id !== work.id && (local.draftTitle || local.title || '') === (work.draftTitle || work.title || '') && (local.topic || '') === (work.topic || '') && (local.draft || '') === (work.draft || '') && JSON.stringify(local.ideas || []) === JSON.stringify(work.ideas || [])); if (duplicate) { if (state.activeWorkId === duplicate.id) state.activeWorkId = work.id; merged.delete(duplicate.id); } merged.set(work.id, work); });
+      state.works = [...merged.values()].sort((a,b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+      if (progress) { state.profile = { ...defaultState().profile, ...(progress.profile || {}) }; state.activeStage = progress.active_stage || state.activeStage; state.completedStages = progress.completed_stages || []; state.checklist = { ...defaultState().checklist, ...(progress.checklist || {}) }; state.sessionsByDay = progress.sessions_by_day || {}; state.activeDays = progress.active_days || []; state.totalSessions = progress.total_sessions || 0; state.totalWords = progress.total_words || 0; state.bestStreak = progress.best_streak || 0; }
+      const active = state.works.find(work => work.id === state.activeWorkId) || state.works[0];
+      if (active) applyWork(active, false); else { state.activeWorkId = null; state.topic = ''; state.draftTitle = ''; state.draft = ''; state.ideas = []; state.outline = defaultState().outline; }
+      save(); syncInputs(); syncProfileForm(); updateProfileUI(); renderProgress(); renderReview(); renderWorks(); setStage(state.activeStage || 'brainstorming');
+    } finally { skipCloudSync = false; }
+    setAuthStatus(`Signed in · ${authUser.email || 'account'} · cloud works loaded`); showToast('Cloud works loaded.'); return true;
+  }
+  async function handleAuth(action) {
+    if (!supabaseClient) { setAuthMessage('Configure Supabase in config.js first.', true); return; }
+    const email = $('authEmail').value.trim(), password = $('authPassword').value;
+    if (!email || !password) { setAuthMessage('Enter your email and password.', true); return; }
+    if (action === 'signup' && password.length < 8) { setAuthMessage('Use a password with at least 8 characters.', true); return; }
+    setAuthMessage(action === 'signup' ? 'Creating account…' : 'Signing in…');
+    try {
+      let result;
+      if (action === 'signup') result = await supabaseClient.auth.signUp({ email, password, options: { data: { display_name: state.profile.name || 'Writer' } } });
+      else result = await supabaseClient.auth.signInWithPassword({ email, password });
+      if (result.error) throw result.error;
+      if (action === 'signup' && !result.data.session) { setAuthMessage('Account created. Check your email to confirm it, then sign in.'); return; }
+      authSession = result.data.session; authUser = result.data.user; renderAuthUI();
+      if (authUser && authSession) { await loadCloudState({ confirmReplace: true }); setAuthMessage('Account connected.'); }
+    } catch (error) { setAuthMessage(error.message || 'Authentication failed.', true); }
+  }
+  async function apiAI(task, payload) {
+    if (!authSession?.access_token || !authUser) throw new Error('Sign in to your Supabase account before using AI.');
+    const response = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authSession.access_token}` }, body: JSON.stringify({ task, payload }) });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `AI request failed (${response.status}).`);
+    if (!data.result) throw new Error('The AI service returned an empty result.');
+    return data.result;
+  }
+  function parseAIJson(result) { const raw = typeof result === 'string' ? result : JSON.stringify(result); const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''); return JSON.parse(cleaned); }
+  async function initializeAuth() {
+    if (!supabaseClient) { renderAuthUI(); return; }
+    try { const { data, error } = await supabaseClient.auth.getSession(); if (error) throw error; authSession = data.session; authUser = data.session?.user || null; renderAuthUI(); if (authUser) { await loadCloudState({ confirmReplace: true }); } }
+    catch (error) { console.error(error); setAuthStatus('Supabase connection issue. Local saving is still available.'); }
+    supabaseClient.auth.onAuthStateChange((event, session) => { authSession = session; authUser = session?.user || null; renderAuthUI(); if (event === 'SIGNED_OUT') setAuthMessage('Signed out. Your local copy remains saved.'); });
+  }
   function showToast(message) { const t = $('toast'); t.textContent = message; t.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2400); }
   function words(text) { const matches = text.trim().match(/\b[\p{L}\p{N}]+(?:['’][\p{L}]+)?\b/gu); return matches ? matches.length : 0; }
   function escapeHtml(str) { return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -70,7 +175,9 @@
   function renderReview() { const {good,improve} = reviewData(); $('goodPoints').innerHTML = good.map(x=>`<li>${escapeHtml(x)}</li>`).join(''); $('improvementPoints').innerHTML = improve.map(x=>`<li>${escapeHtml(x)}</li>`).join(''); const checks = Object.values(state.checklist).filter(Boolean).length; const score = Math.min(100, Math.round((Math.min(words(state.draft),500)/500*35) + (state.topic.trim()?10:0) + (Math.min(state.ideas.length,4)/4*15) + (Object.values(state.outline).filter(x=>x.trim()).length/4*20) + (checks/4*20))); $('reviewScore').textContent = score; $('reviewRing').style.background = `conic-gradient(#70a979 ${score*3.6}deg, transparent ${score*3.6}deg)`; $('reviewRing').style.borderColor = '#dcebdd'; $('reviewMessage').textContent = score >= 75 ? 'Good progress. Review the suggestions before your final edit.' : score >= 40 ? 'You have a solid start. A few more details will strengthen it.' : 'Build your outline and draft, then return for a more useful review.'; }
   function renderProgress() { updateProfileUI(); const count = words(state.draft); $('statWords').textContent = count.toLocaleString(); $('statSessions').textContent = state.totalSessions || 0; $('statStreak').innerHTML = `${currentStreak()} <small>days</small>`; $('statStages').innerHTML = `${state.completedStages.length} <small>/ 3</small>`; const days=[]; for(let i=6;i>=0;i--) days.push(dateOffset(-i)); const counts=days.map(d => state.sessionsByDay[d] || 0); const max=Math.max(1,...counts); const labels=['Sun','Mon','Tue','Wed','Thu','Fri','Sat']; $('activityChart').innerHTML=days.map((d,i)=>`<div class="chart-day ${counts[i]?'active':''} ${d===todayKey?'today':''}"><div class="chart-bar-wrap" title="${counts[i]} focus sessions"><div class="chart-bar" style="height:${Math.max(3,counts[i]/max*100)}%"></div></div><span>${labels[new Date(`${d}T12:00:00`).getDay()]}</span></div>`).join(''); $('weekTotal').textContent=`${days.filter(d=>state.activeDays.includes(d)).length} active days`; const items=[['brainstorming','Brainstorming','Topic, ideas, and outline'],['drafting','Drafting','Write and develop your argument'],['polishing','Polishing','Review and refine your essay']]; $('stageProgressList').innerHTML=items.map(([key,label,desc])=>`<div class="stage-progress-row"><span class="stage-progress-icon">${state.completedStages.includes(key)?'✓':'○'}</span><span class="stage-progress-info"><strong>${label}</strong><small>${desc}</small></span><span class="stage-status">${state.completedStages.includes(key)?'Completed':'In progress'}</span></div>`).join(''); renderWeek(); renderTimerSessions(); renderStageChecks(); }
   function markStage(stage) { if (!state.completedStages.includes(stage)) state.completedStages.push(stage); recordActiveDay(); save(); renderStageChecks(); renderProgress(); }
-  function switchView(view) { document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`)); document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view)); $('breadcrumbCurrent').textContent= view==='workspace'?'Writing space':view==='progress'?'My progress':'Profile'; $('sidebar').classList.remove('open'); if(view==='progress') renderProgress(); if(view==='profile') syncProfileForm(); window.scrollTo({top:0,behavior:'smooth'}); }
+  function switchView(view) { document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${view}`)); document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view)); $('breadcrumbCurrent').textContent= view==='workspace'?'Writing space':view==='progress'?'My progress':view==='works'?'My Works':'Profile'; $('sidebar').classList.remove('open'); if(view==='progress') renderProgress(); if(view==='profile') syncProfileForm(); if(view==='works') renderWorks(); window.scrollTo({top:0,behavior:'smooth'}); }
+  function applyWork(work, persist = true) { state.activeWorkId = work.id; state.topic = work.topic || ''; state.draftTitle = work.draftTitle || work.title || ''; state.draft = work.draft || ''; state.ideas = Array.isArray(work.ideas) ? [...work.ideas] : []; state.outline = { ...defaultState().outline, ...(work.outline || {}) }; state.activeStage = work.activeStage || 'brainstorming'; state.completedStages = Array.isArray(work.completedStages) ? [...work.completedStages] : []; state.checklist = { ...defaultState().checklist, ...(work.checklist || {}) }; syncInputs(); renderReview(); setStage(state.activeStage); if (persist) save(); }
+  function renderWorks() { const list = $('worksList'); if (!list) return; if (!state.works.length) { list.innerHTML = '<div class="works-empty"><span>✎</span><h2>Your next essay starts here.</h2><p>Create a draft or start writing in your workspace. Your work will be saved automatically.</p></div>'; return; } const sorted = [...state.works].sort((a,b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0)); list.innerHTML = sorted.map(work => { const count = words(work.draft || ''); const title = work.draftTitle || work.title || work.topic || 'Untitled draft'; const excerpt = (work.draft || work.topic || 'No draft text yet. Add ideas or start writing.').trim().replace(/\s+/g,' ').slice(0,150); const updated = new Date(work.updatedAt || Date.now()).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}); return `<article class="work-card ${work.id===state.activeWorkId?'work-card-active':''}"><div class="work-card-top"><span class="work-kind">${count ? 'ESSAY DRAFT' : 'WRITING PLAN'}</span><span class="work-date">${escapeHtml(updated)}</span></div><h2>${escapeHtml(title)}</h2><p>${escapeHtml(excerpt)}</p><div class="work-card-meta"><span>${count} words</span><span>${escapeHtml(work.activeStage || 'brainstorming')}</span></div><div class="work-card-actions"><button class="primary-button" data-work-open="${escapeHtml(work.id)}">${work.id===state.activeWorkId?'Continue editing':'Open work'} <span>→</span></button><button class="secondary-button" data-work-rename="${escapeHtml(work.id)}">Rename</button><button class="work-delete" data-work-delete="${escapeHtml(work.id)}" aria-label="Delete ${escapeHtml(title)}">Delete</button></div></article>`; }).join(''); }
   function syncProfileForm() { $('profileName').value=state.profile.name; $('profileGoal').value=state.profile.goal; $('profileWordGoal').value=String(state.profile.wordGoal); }
   function syncInputs() { $('essayTopic').value=state.topic; $('draftTitle').value=state.draftTitle; $('draftText').value=state.draft; $('outlineIntro').value=state.outline.intro; $('outlineBody1').value=state.outline.body1; $('outlineBody2').value=state.outline.body2; $('outlineConclusion').value=state.outline.conclusion; document.querySelectorAll('[data-review-check]').forEach(c=>c.checked=!!state.checklist[c.dataset.reviewCheck]); updateDraftCounts(); renderIdeas(); }
   $('ideaForm').addEventListener('submit',e=>{e.preventDefault();const val=$('ideaInput').value.trim();if(!val)return;if(state.ideas.includes(val)){showToast('That idea is already in your list.');return;}state.ideas.push(val);$('ideaInput').value='';recordActiveDay();save();renderIdeas();renderProgress();});
@@ -93,10 +200,37 @@
   $('finishSession').addEventListener('click',()=>{markStage('polishing');renderReview();renderProgress();showToast('Writing session saved. Great work!');switchView('progress');});
   document.querySelectorAll('.timer-mode').forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.mode)));$('toggleTimer').addEventListener('click',startTimer);$('resetTimer').addEventListener('click',()=>{stopTimer();remaining=mode==='focus'?25*60:5*60;updateTimerUI();});$('skipTimer').addEventListener('click',()=>setMode(mode==='focus'?'break':'focus'));
   document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.view)));$('mobileMenu').addEventListener('click',()=>$('sidebar').classList.toggle('open'));document.addEventListener('click',e=>{if(window.innerWidth<=900&&$('sidebar').classList.contains('open')&&!$('sidebar').contains(e.target)&&!$('mobileMenu').contains(e.target))$('sidebar').classList.remove('open');});
+  $('newWorkButton').addEventListener('click',()=>{ syncActiveWork(); const id=makeId(); state.activeWorkId=id; state.topic='';state.ideas=[];state.outline=defaultState().outline;state.draftTitle='';state.draft='';state.activeStage='brainstorming';state.completedStages=[];state.checklist=defaultState().checklist;syncInputs();setStage('brainstorming');save();switchView('workspace');$('draftTitle').focus();showToast('New draft created.'); });
+  $('worksList').addEventListener('click',async e=>{ const open=e.target.closest('[data-work-open]');const rename=e.target.closest('[data-work-rename]');const del=e.target.closest('[data-work-delete]'); if(open){ const work=state.works.find(item=>item.id===open.dataset.workOpen);if(work){syncActiveWork();applyWork(work);switchView('workspace');showToast('Work opened.');}return;} if(rename){const work=state.works.find(item=>item.id===rename.dataset.workRename);if(!work)return;const name=window.prompt('Give this work a new title',work.draftTitle||work.title||'Untitled draft');if(name===null)return;const clean=name.trim().slice(0,180);if(!clean){showToast('A title cannot be empty.');return;}work.title=clean;work.draftTitle=clean;work.updatedAt=new Date().toISOString();if(work.id===state.activeWorkId)state.draftTitle=clean;save();renderWorks();showToast('Work renamed.');return;}if(del){const work=state.works.find(item=>item.id===del.dataset.workDelete);if(!work||!window.confirm(`Delete “${work.draftTitle||work.title||'Untitled draft'}”? This cannot be undone.`))return;if(supabaseClient&&authUser){try{const {error}=await supabaseClient.from('essays').delete().eq('id',work.id).eq('user_id',authUser.id);if(error)throw error;}catch(error){console.error(error);showToast('Cloud delete failed. Your work was kept. Check your connection and try again.');return;}}state.works=state.works.filter(item=>item.id!==work.id);if(state.activeWorkId===work.id){state.activeWorkId=null;state.topic='';state.ideas=[];state.outline=defaultState().outline;state.draftTitle='';state.draft='';state.activeStage='brainstorming';state.completedStages=[];state.checklist=defaultState().checklist;syncInputs();}save();renderWorks();showToast('Work deleted.');}});
+
+  $('aiBuildPlan').addEventListener('click', async () => {
+    if (!state.topic.trim()) { setAiStatus('planAiStatus', 'Add an essay question or topic first.', true); return; }
+    if (!state.ideas.length) { setAiStatus('planAiStatus', 'Add at least one idea so the plan is based on your thinking.', true); return; }
+    $('aiBuildPlan').disabled = true; setAiStatus('planAiStatus', 'Building a plan from your ideas…');
+    try { const result = parseAIJson(await apiAI('outline', { topic: state.topic, ideas: state.ideas })); const map = { intro: 'outlineIntro', body1: 'outlineBody1', body2: 'outlineBody2', conclusion: 'outlineConclusion' }; Object.entries(map).forEach(([key,id]) => { if (typeof result[key] === 'string') { state.outline[key] = result[key]; $(id).value = result[key]; } }); save(); setAiStatus('planAiStatus', 'AI plan added to your outline. Review and edit it in your own words.'); showToast('AI outline created.'); }
+    catch (error) { setAiStatus('planAiStatus', error.message, true); } finally { $('aiBuildPlan').disabled = false; }
+  });
+  $('aiSynonyms').addEventListener('click', async () => { const word = $('synonymWord').value.trim(); if (!word) { setAiStatus('synonymAiStatus', 'Enter a word or phrase first.', true); return; } $('aiSynonyms').disabled = true; $('synonymResults').hidden = true; setAiStatus('synonymAiStatus', 'Finding context-appropriate alternatives…');
+    try { const result = parseAIJson(await apiAI('synonyms', { word, context: state.draft.slice(-1800) })); const items = Array.isArray(result.synonyms) ? result.synonyms : []; if (!items.length) throw new Error('No synonyms were returned. Try another word.'); $('synonymResults').innerHTML = items.map(item => `<button class="ai-result-item" type="button" data-synonym="${escapeHtml(item.word || '')}"><strong>${escapeHtml(item.word || '')}</strong><span>${escapeHtml(item.nuance || item.meaning || '')}</span><small>${escapeHtml(item.example || '')}</small></button>`).join(''); $('synonymResults').hidden = false; setAiStatus('synonymAiStatus', 'Choose an alternative to insert it into your draft.'); } catch (error) { setAiStatus('synonymAiStatus', error.message, true); } finally { $('aiSynonyms').disabled = false; }
+  });
+  $('synonymResults').addEventListener('click', e => { const b = e.target.closest('[data-synonym]'); if (!b) return; insertAtCursor($('draftText'), b.dataset.synonym); state.draft = $('draftText').value; updateDraftCounts(); save(); showToast('Synonym inserted into your draft.'); });
+  $('aiReview').addEventListener('click', async () => { if (!state.draft.trim()) { setAiStatus('reviewAiStatus', 'Write a draft before requesting AI feedback.', true); return; } $('aiReview').disabled = true; $('aiReviewResults').hidden = true; setAiStatus('reviewAiStatus', 'Analysing your essay and preparing explanations…');
+    try { const result = parseAIJson(await apiAI('review', { topic: state.topic, title: state.draftTitle, draft: state.draft })); const sections = [['Strengths', result.strengths], ['Priority improvements', result.improvements], ['Language corrections', result.corrections]]; $('aiReviewResults').innerHTML = sections.map(([title, items]) => `<section class="ai-result-section"><h3>${escapeHtml(title)}</h3>${Array.isArray(items) && items.length ? `<ul>${items.map(item => `<li><strong>${escapeHtml(item.issue || item.point || item.original || '')}</strong>${item.explanation ? `<p>${escapeHtml(item.explanation)}</p>` : ''}${item.suggestion ? `<p><span>Suggestion:</span> ${escapeHtml(item.suggestion)}</p>` : ''}${item.corrected ? `<p><span>Correction:</span> ${escapeHtml(item.corrected)}</p>` : ''}</li>`).join('')}</ul>` : '<p>No items returned for this section.</p>'}</section>`).join(''); $('aiReviewResults').hidden = false; setAiStatus('reviewAiStatus', 'AI feedback is ready. These are suggestions, not an official grade.'); } catch (error) { setAiStatus('reviewAiStatus', error.message, true); } finally { $('aiReview').disabled = false; }
+  });
+  $('signInButton').addEventListener('click', () => handleAuth('signin')); $('signUpButton').addEventListener('click', () => handleAuth('signup'));
+  $('signOutButton').addEventListener('click', async () => { if (!supabaseClient) return; try { const { error } = await supabaseClient.auth.signOut(); if (error) throw error; authSession = null; authUser = null; renderAuthUI(); setAuthMessage('Signed out. Your local copy remains saved.'); } catch (error) { setAuthMessage(error.message, true); } });
+  $('cloudLoadButton').addEventListener('click', async () => { try { await loadCloudState({ confirmReplace: true }); setAuthMessage('Cloud workspace checked.'); } catch (error) { setAuthMessage(error.message || 'Could not load cloud data.', true); } });
   $('profileForm').addEventListener('submit',e=>{e.preventDefault();state.profile.name=$('profileName').value.trim()||'Writer';state.profile.goal=$('profileGoal').value;state.profile.wordGoal=Number($('profileWordGoal').value);save();updateProfileUI();$('profileMessage').textContent='Profile saved on this device.';setTimeout(()=>$('profileMessage').textContent='',2600);showToast('Profile updated.');});
   $('resetAll').addEventListener('click',()=>{if(confirm('Reset all PomoWrite data saved in this browser? This cannot be undone.')){stopTimer();localStorage.removeItem(STORAGE_KEY);state=defaultState();syncInputs();syncProfileForm();setMode('focus');updateProfileUI();renderProgress();renderReview();switchView('workspace');showToast('Local data reset.');}});
+
+  const THEME_KEY = 'pomowrite-theme';
+  const systemTheme = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  function applyTheme(preference = localStorage.getItem(THEME_KEY) || 'auto') { const effective = preference === 'auto' ? (systemTheme?.matches ? 'dark' : 'light') : preference; document.documentElement.dataset.theme = effective; document.documentElement.dataset.themePreference = preference; const button = $('themeToggle'); if (button) { const label = preference === 'auto' ? `Theme: Auto (${effective})` : `Theme: ${preference[0].toUpperCase()+preference.slice(1)}`; button.title = `${label} · click to change`; button.setAttribute('aria-label', `${label}. Click to cycle theme preference.`); button.textContent = preference === 'auto' ? '◐ Auto' : preference === 'dark' ? '☾ Dark' : '☀ Light'; } const meta = document.querySelector('meta[name="theme-color"]'); if (meta) meta.content = effective === 'dark' ? '#151a16' : '#f7f9f6'; }
+  function cycleTheme() { const current = localStorage.getItem(THEME_KEY) || 'auto'; const next = current === 'auto' ? 'dark' : current === 'dark' ? 'light' : 'auto'; localStorage.setItem(THEME_KEY,next); applyTheme(next); }
+  $('themeToggle').addEventListener('click',cycleTheme); applyTheme(); if (systemTheme?.addEventListener) systemTheme.addEventListener('change',()=>{if((localStorage.getItem(THEME_KEY)||'auto')==='auto')applyTheme('auto');}); else if (systemTheme?.addListener) systemTheme.addListener(()=>{if((localStorage.getItem(THEME_KEY)||'auto')==='auto')applyTheme('auto');});
+
   let tipIndex=Math.floor(Math.random()*tips.length);$('dailyTip').textContent=tips[tipIndex];$('nextTip').addEventListener('click',()=>{tipIndex=(tipIndex+1)%tips.length;$('dailyTip').textContent=tips[tipIndex];});
   const dateText=new Intl.DateTimeFormat('en',{weekday:'long',month:'short',day:'numeric'}).format(new Date());$('todayLabel').textContent=dateText;
   // If the user returns on a new day, the streak is calculated from recorded active days.
-  syncInputs();syncProfileForm();updateProfileUI();renderVocab();renderConnectors();renderWeek();renderTimerSessions();renderStageChecks();renderProgress();renderReview();setStage(state.activeStage||'brainstorming');updateTimerUI();
+  if (!state.works.length && hasCurrentWork()) { state.activeWorkId = state.activeWorkId || makeId(); syncActiveWork(); } else if (state.activeWorkId && state.works.length) { const active = state.works.find(work => work.id === state.activeWorkId); if (active) applyWork(active, false); } syncInputs();syncProfileForm();updateProfileUI();renderWorks();renderVocab();renderConnectors();renderWeek();renderTimerSessions();renderStageChecks();renderProgress();renderReview();setStage(state.activeStage||'brainstorming');updateTimerUI();renderAuthUI();initializeAuth();
 })();
